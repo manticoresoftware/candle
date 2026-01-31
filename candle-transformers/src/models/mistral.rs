@@ -426,6 +426,24 @@ impl Model {
         &self.embed_tokens
     }
 
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            let mask = self.prepare_decoder_attention_mask(seq_len, seqlen_offset)?;
+            Some(mask)
+        };
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+        }
+        xs.apply(&self.norm)
+    }
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (_b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {

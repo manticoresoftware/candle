@@ -392,6 +392,22 @@ impl Model {
             .to_dtype(self.dtype)
     }
 
+    pub fn forward_hidden_states(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            let mask = self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset)?;
+            Some(mask)
+        };
+        let xs = self.embed_tokens.forward(input_ids)?;
+        self.forward_embeds_without_projection(&xs, attention_mask.as_ref(), seqlen_offset)
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
         let attention_mask = if seq_len <= 1 {
