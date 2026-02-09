@@ -1,7 +1,9 @@
 use crate::{
     fused_moe::{FusedMoe, MoeCfg},
     models::{
-        qwen3::{Config as Qwen3Config, Qwen3Attention, Qwen3MLP, Qwen3RotaryEmbedding},
+        qwen3::{
+            Config as Qwen3Config, Qwen3Attention, Qwen3Cache, Qwen3MLP, Qwen3RotaryEmbedding,
+        },
         with_tracing::{linear_no_bias, Linear, RmsNorm},
     },
 };
@@ -247,17 +249,19 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        kv_cache: &mut candle_nn::kv_cache::ConcatKvCache,
+    ) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.self_attn.forward(&h, mask, offset)?;
+        let h = self.self_attn.forward(&h, mask, offset, kv_cache)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = self.feed_forward.forward(&h2, mask.is_some())?;
         x + h2
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -268,6 +272,7 @@ pub struct Model {
     norm: RmsNorm,
     device: Device,
     dtype: DType,
+    kv_cache: Qwen3Cache,
 }
 
 impl Model {
@@ -290,13 +295,12 @@ impl Model {
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            kv_cache: Qwen3Cache::new(cfg.num_hidden_layers),
         })
     }
 
     fn clear_kv_cache(&mut self) {
-        for l in &mut self.layers {
-            l.clear_kv_cache();
-        }
+        self.kv_cache.clear();
     }
 
     fn causal_mask(
@@ -336,8 +340,9 @@ impl Model {
             Some(self.causal_mask(b, l, offset, None)?)
         };
 
-        for layer in &mut self.layers {
-            h = layer.forward(&h, causal.as_ref(), offset)?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            h = layer.forward(&h, causal.as_ref(), offset, layer_cache)?;
         }
         self.norm.forward(&h)
     }

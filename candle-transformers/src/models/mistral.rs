@@ -210,7 +210,6 @@ struct Attention {
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
     use_flash_attn: bool,
 }
 
@@ -235,16 +234,16 @@ impl Attention {
             num_kv_groups,
             head_dim,
             rotary_emb,
-            kv_cache: None,
             use_flash_attn: cfg.use_flash_attn,
         })
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -269,7 +268,7 @@ impl Attention {
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states) = match kv_cache.as_ref() {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
@@ -277,7 +276,7 @@ impl Attention {
                 (key_states, value_states)
             }
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        *kv_cache = Some((key_states.clone(), value_states.clone()));
 
         let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?;
         let value_states = crate::utils::repeat_kv(value_states, self.num_kv_groups)?;
@@ -305,9 +304,28 @@ impl Attention {
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?
             .apply(&self.o_proj)
     }
+}
 
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
+#[derive(Debug, Clone)]
+pub struct MistralCache {
+    layers: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl MistralCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: vec![None; num_layers],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for cache in &mut self.layers {
+            *cache = None;
+        }
+    }
+
+    fn layer_mut(&mut self, idx: usize) -> &mut Option<(Tensor, Tensor)> {
+        &mut self.layers[idx]
     }
 }
 
@@ -339,22 +357,21 @@ impl DecoderLayer {
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let xs = self
+            .self_attn
+            .forward(&xs, attention_mask, seqlen_offset, kv_cache)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
         residual + xs
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache()
     }
 }
 
@@ -367,6 +384,7 @@ pub struct Model {
     sliding_window: Option<usize>,
     device: Device,
     dtype: DType,
+    kv_cache: MistralCache,
 }
 
 impl Model {
@@ -391,6 +409,7 @@ impl Model {
             sliding_window: cfg.sliding_window,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            kv_cache: MistralCache::new(cfg.num_hidden_layers),
         })
     }
 
@@ -439,8 +458,30 @@ impl Model {
             Some(mask)
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, layer_cache)?
+        }
+        xs.apply(&self.norm)
+    }
+
+    pub fn forward_hidden_states_with_cache(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        cache: &mut MistralCache,
+    ) -> Result<Tensor> {
+        let (_b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            let mask = self.prepare_decoder_attention_mask(seq_len, seqlen_offset)?;
+            Some(mask)
+        };
+        let mut xs = self.embed_tokens.forward(input_ids)?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.layer_mut(idx);
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, layer_cache)?
         }
         xs.apply(&self.norm)
     }
@@ -453,8 +494,9 @@ impl Model {
             Some(mask)
         };
         let mut xs = self.embed_tokens.forward(input_ids)?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, layer_cache)?
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
@@ -469,8 +511,9 @@ impl Model {
     ) -> Result<Tensor> {
         let (_b_size, seq_len, _) = xs.dims3()?;
         let mut xs = xs.clone();
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attn_mask, seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attn_mask, seqlen_offset, layer_cache)?
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
@@ -478,8 +521,10 @@ impl Model {
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.clear_kv_cache()
-        }
+        self.kv_cache.clear();
+    }
+
+    pub fn new_cache(&self) -> MistralCache {
+        MistralCache::new(self.layers.len())
     }
 }

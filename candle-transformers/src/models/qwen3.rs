@@ -108,7 +108,6 @@ pub(crate) struct Qwen3Attention {
     hidden_size: usize,
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
-    kv_cache: ConcatKvCache,
 }
 
 impl Qwen3Attention {
@@ -157,10 +156,6 @@ impl Qwen3Attention {
         // Necessary because the hidden_size in the config isn't always accurate
         let hidden_size = head_dim * cfg.num_attention_heads;
 
-        // dim=2 because we concatenate along the sequence dimension
-        // For tensors of shape [batch, heads, seq, head_dim]
-        let kv_cache = ConcatKvCache::new(2);
-
         Ok(Self {
             q_proj,
             k_proj,
@@ -174,15 +169,15 @@ impl Qwen3Attention {
             head_dim,
             hidden_size,
             rotary_emb,
-            kv_cache,
         })
     }
 
     pub(crate) fn forward(
-        &mut self,
+        &self,
         x: &Tensor,
         attn_mask: Option<&Tensor>,
         offset: usize,
+        kv_cache: &mut ConcatKvCache,
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
@@ -214,7 +209,7 @@ impl Qwen3Attention {
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
         // 5. Accumulate KV cache
-        let (k, v) = self.kv_cache.append(&k, &v)?;
+        let (k, v) = kv_cache.append(&k, &v)?;
 
         // 6. GQA repeat_kv
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
@@ -234,9 +229,28 @@ impl Qwen3Attention {
             .reshape((b, l, self.hidden_size))?
             .apply(&self.o_proj)
     }
+}
 
-    pub(crate) fn clear_kv_cache(&mut self) {
-        self.kv_cache.reset();
+#[derive(Debug, Clone)]
+pub struct Qwen3Cache {
+    layers: Vec<ConcatKvCache>,
+}
+
+impl Qwen3Cache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: (0..num_layers).map(|_| ConcatKvCache::new(2)).collect(),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for cache in &mut self.layers {
+            cache.reset();
+        }
+    }
+
+    pub(crate) fn layer_mut(&mut self, idx: usize) -> &mut ConcatKvCache {
+        &mut self.layers[idx]
     }
 }
 
@@ -266,17 +280,19 @@ impl DecoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+    fn forward(
+        &self,
+        x: &Tensor,
+        mask: Option<&Tensor>,
+        offset: usize,
+        kv_cache: &mut ConcatKvCache,
+    ) -> Result<Tensor> {
         let h = self.ln1.forward(x)?;
-        let h = self.self_attn.forward(&h, mask, offset)?;
+        let h = self.self_attn.forward(&h, mask, offset, kv_cache)?;
         let x = (x + h)?;
         let h2 = self.ln2.forward(&x)?;
         let h2 = h2.apply(&self.mlp)?;
         x + h2
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache();
     }
 }
 
@@ -287,6 +303,7 @@ pub struct Model {
     norm: RmsNorm,
     device: Device,
     dtype: DType,
+    kv_cache: Qwen3Cache,
 }
 
 impl Model {
@@ -305,13 +322,12 @@ impl Model {
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
             device: vb.device().clone(),
             dtype: vb.dtype(),
+            kv_cache: Qwen3Cache::new(cfg.num_hidden_layers),
         })
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for l in &mut self.layers {
-            l.clear_kv_cache();
-        }
+        self.kv_cache.clear();
     }
 
     fn causal_mask(
@@ -351,8 +367,31 @@ impl Model {
             Some(self.causal_mask(b, l, offset, None)?)
         };
 
-        for layer in &mut self.layers {
-            h = layer.forward(&h, causal.as_ref(), offset)?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            h = layer.forward(&h, causal.as_ref(), offset, layer_cache)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    pub fn forward_with_cache(
+        &self,
+        input: &Tensor,
+        offset: usize,
+        cache: &mut Qwen3Cache,
+    ) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+
+        let causal = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset, None)?)
+        };
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.layer_mut(idx);
+            h = layer.forward(&h, causal.as_ref(), offset, layer_cache)?;
         }
         self.norm.forward(&h)
     }

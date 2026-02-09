@@ -158,7 +158,6 @@ struct Attention {
     num_kv_groups: usize,
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
-    kv_cache: Option<(Tensor, Tensor)>,
     use_flash_attn: bool,
 }
 
@@ -189,16 +188,16 @@ impl Attention {
             num_kv_groups,
             head_dim,
             rotary_emb,
-            kv_cache: None,
             use_flash_attn,
         })
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
@@ -220,7 +219,7 @@ impl Attention {
             self.rotary_emb
                 .apply_rotary_emb_qkv(&query_states, &key_states, seqlen_offset)?;
 
-        let (key_states, value_states) = match &self.kv_cache {
+        let (key_states, value_states) = match kv_cache.as_ref() {
             None => (key_states, value_states),
             Some((prev_k, prev_v)) => {
                 let key_states = Tensor::cat(&[prev_k, &key_states], 2)?;
@@ -228,7 +227,7 @@ impl Attention {
                 (key_states, value_states)
             }
         };
-        self.kv_cache = Some((key_states.clone(), value_states.clone()));
+        *kv_cache = Some((key_states.clone(), value_states.clone()));
 
         let key_states = crate::utils::repeat_kv(key_states, self.num_kv_groups)?.contiguous()?;
         let value_states =
@@ -257,10 +256,6 @@ impl Attention {
             .reshape((b_sz, q_len, ()))?
             .apply(&self.o_proj)
     }
-
-    fn clear_kv_cache(&mut self) {
-        self.kv_cache = None
-    }
 }
 
 #[cfg(feature = "flash-attn")]
@@ -277,6 +272,29 @@ fn flash_attn(
 #[cfg(not(feature = "flash-attn"))]
 fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
     unimplemented!("compile with '--features flash-attn'")
+}
+
+#[derive(Debug, Clone)]
+pub struct GemmaCache {
+    layers: Vec<Option<(Tensor, Tensor)>>,
+}
+
+impl GemmaCache {
+    pub fn new(num_layers: usize) -> Self {
+        Self {
+            layers: vec![None; num_layers],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for cache in &mut self.layers {
+            *cache = None;
+        }
+    }
+
+    fn layer_mut(&mut self, idx: usize) -> &mut Option<(Tensor, Tensor)> {
+        &mut self.layers[idx]
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -312,22 +330,21 @@ impl DecoderLayer {
     }
 
     fn forward(
-        &mut self,
+        &self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        kv_cache: &mut Option<(Tensor, Tensor)>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(&xs, attention_mask, seqlen_offset)?;
+        let xs = self
+            .self_attn
+            .forward(&xs, attention_mask, seqlen_offset, kv_cache)?;
         let xs = (xs + residual)?;
         let residual = &xs;
         let xs = xs.apply(&self.post_attention_layernorm)?.apply(&self.mlp)?;
         residual + xs
-    }
-
-    fn clear_kv_cache(&mut self) {
-        self.self_attn.clear_kv_cache()
     }
 }
 
@@ -340,6 +357,7 @@ pub struct Model {
     device: Device,
     dtype: DType,
     hidden_size: usize,
+    kv_cache: GemmaCache,
 }
 
 impl Model {
@@ -365,6 +383,7 @@ impl Model {
             device: vb.device().clone(),
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
+            kv_cache: GemmaCache::new(cfg.num_hidden_layers),
         })
     }
 
@@ -405,7 +424,34 @@ impl Model {
             Some(mask)
         };
         let xs = self.embed_tokens.forward(input_ids)?;
-        self.forward_embeds_without_projection(&xs, attention_mask.as_ref(), seqlen_offset)
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, layer_cache)?
+        }
+        Ok(xs)
+    }
+
+    pub fn forward_hidden_states_with_cache(
+        &self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        cache: &mut GemmaCache,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+        let attention_mask = if seq_len <= 1 {
+            None
+        } else {
+            let mask = self.prepare_decoder_attention_mask(b_size, seq_len, seqlen_offset)?;
+            Some(mask)
+        };
+        let xs = self.embed_tokens.forward(input_ids)?;
+        self.forward_embeds_without_projection_with_cache(
+            &xs,
+            attention_mask.as_ref(),
+            seqlen_offset,
+            cache,
+        )
     }
 
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
@@ -418,8 +464,9 @@ impl Model {
         };
         let xs = self.embed_tokens.forward(input_ids)?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attention_mask.as_ref(), seqlen_offset, layer_cache)?
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
@@ -433,8 +480,9 @@ impl Model {
     ) -> Result<Tensor> {
         let (_, seq_len, _) = xs.dims3()?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attn_mask, seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attn_mask, seqlen_offset, layer_cache)?
         }
         xs.narrow(1, seq_len - 1, 1)?
             .apply(&self.norm)?
@@ -450,15 +498,34 @@ impl Model {
     ) -> Result<Tensor> {
         let (_, _, _) = xs.dims3()?;
         let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
-        for layer in self.layers.iter_mut() {
-            xs = layer.forward(&xs, attn_mask, seqlen_offset)?
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = self.kv_cache.layer_mut(idx);
+            xs = layer.forward(&xs, attn_mask, seqlen_offset, layer_cache)?
+        }
+        Ok(xs)
+    }
+
+    pub fn forward_embeds_without_projection_with_cache(
+        &self,
+        xs: &Tensor,
+        attn_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+        cache: &mut GemmaCache,
+    ) -> Result<Tensor> {
+        let (_, _, _) = xs.dims3()?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let layer_cache = cache.layer_mut(idx);
+            xs = layer.forward(&xs, attn_mask, seqlen_offset, layer_cache)?
         }
         Ok(xs)
     }
 
     pub fn clear_kv_cache(&mut self) {
-        for layer in self.layers.iter_mut() {
-            layer.clear_kv_cache()
-        }
+        self.kv_cache.clear();
+    }
+
+    pub fn new_cache(&self) -> GemmaCache {
+        GemmaCache::new(self.layers.len())
     }
 }
