@@ -975,8 +975,10 @@ fn simple_eval_(
                 if inputs.is_empty() {
                     bail!("empty concat")
                 };
-                // Find minimum rank among inputs and squeeze trailing singleton dims to match
-                let min_rank = inputs.iter().map(|t| t.rank()).min().unwrap();
+                // Find minimum rank among inputs and squeeze trailing singleton dims to match.
+                // Never squeeze below rank 1 to avoid breaking axis normalization
+                // for shape-construction patterns (Shape → Gather → Unsqueeze → Concat).
+                let min_rank = inputs.iter().map(|t| t.rank()).min().unwrap().max(1);
                 let inputs: Vec<_> = inputs
                     .into_iter()
                     .map(|t| {
@@ -989,17 +991,27 @@ fn simple_eval_(
                                 break;
                             }
                         }
+                        // Ensure scalars are at least 1D for Concat
+                        if t.rank() == 0 {
+                            t = t.unsqueeze(0).unwrap_or(t);
+                        }
                         t
                     })
                     .collect();
-                let axis = inputs[0].normalize_axis(axis)?;
-                let output = Tensor::cat(&inputs, axis).map_err(|e| {
-                    let shapes: Vec<_> = inputs.iter().map(|t| format!("{:?}", t.dims())).collect();
-                    candle::Error::Msg(format!(
-                        "Concat failed for node '{}': {} (input shapes: {:?})",
-                        node.name, e, shapes
-                    ))
-                })?;
+                // Single-input Concat is a no-op pass-through regardless of axis
+                let output = if inputs.len() == 1 {
+                    inputs.into_iter().next().unwrap()
+                } else {
+                    let axis = inputs[0].normalize_axis(axis)?;
+                    Tensor::cat(&inputs, axis).map_err(|e| {
+                        let shapes: Vec<_> =
+                            inputs.iter().map(|t| format!("{:?}", t.dims())).collect();
+                        candle::Error::Msg(format!(
+                            "Concat failed for node '{}': {} (input shapes: {:?})",
+                            node.name, e, shapes
+                        ))
+                    })?
+                };
                 values.insert(node.output[0].clone(), output);
             }
             "Abs" => {
